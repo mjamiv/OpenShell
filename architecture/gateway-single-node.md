@@ -272,6 +272,28 @@ Writes `/etc/rancher/k3s/registries.yaml` from `REGISTRY_HOST`, `REGISTRY_ENDPOI
 
 Copies bundled manifests from `/opt/openshell/manifests/` to `/var/lib/rancher/k3s/server/manifests/`. This is needed because the volume mount on `/var/lib/rancher/k3s` overwrites any files baked into that path at image build time.
 
+### WSL2 CDI spec watcher
+
+On WSL2 hosts with GPU support, the NVIDIA device plugin generates CDI (Container Device Interface) specs that k3s/containerd cannot consume directly. Two incompatibilities exist: the `cdiVersion` field uses a version that containerd rejects, and the device is named `"all"` instead of the numeric index `"0"` that containerd expects. The entrypoint solves this with a background watcher that transforms the spec in real time.
+
+Three shell variables define the file paths:
+
+| Variable | Value |
+|---|---|
+| `CDI_SPEC_DIR` | `/var/run/cdi` |
+| `CDI_WSL_INPUT` | `/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json` (device plugin output) |
+| `CDI_WSL_OUTPUT` | `/var/run/cdi/openshell-wsl.json` (transformed spec for containerd) |
+
+`transform_wsl_cdi_spec()` uses `jq` to rewrite the input spec: it sets `cdiVersion` to `"0.5.0"` and renames `devices[0].name` from `"all"` to `"0"`. The write is atomic -- `jq` outputs to a PID-suffixed temp file, then `mv` replaces the output path.
+
+`watch_cdi_specs()` runs as a background process:
+
+1. Creates `CDI_SPEC_DIR` if missing.
+2. Checks for a spec already present at startup (handles gateway container restarts). If found and it references `/dev/dxg`, transforms it immediately.
+3. Enters a persistent `inotifywait` loop watching for `close_write` or `moved_to` events on the CDI spec directory. When the device plugin writes or moves a new spec matching the expected filename, and the spec references `/dev/dxg` (confirming WSL2 context), it triggers `transform_wsl_cdi_spec()`.
+
+The watcher only starts when both `GPU_ENABLED=true` and `/dev/dxg` exists (a character device present only on WSL2 hosts). It runs in the background (`watch_cdi_specs &`) before `exec k3s`.
+
 ### Image configuration overrides
 
 When environment variables are set, the entrypoint modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml`:
@@ -301,7 +323,7 @@ GPU support is part of the single-node gateway bootstrap path rather than a sepa
   - **CDI enabled** (daemon reports non-empty `CDISpecDirs`): CDI device injection — `driver="cdi"` with `nvidia.com/gpu=all`. Specs are expected to be pre-generated on the host (e.g. automatically by the `nvidia-cdi-refresh.service` or manually via `nvidia-ctk generate`).
   - **CDI not enabled**: `--gpus all` device request — `driver="nvidia"`, `count=-1`, which relies on the NVIDIA Container Runtime hook.
 - `deploy/docker/Dockerfile.images` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
-- `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
+- `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory. On WSL2 hosts (detected by `/dev/dxg`), the entrypoint also starts a background CDI spec watcher that transforms device plugin specs for k3s/containerd compatibility (see [WSL2 CDI spec watcher](#wsl2-cdi-spec-watcher) under Entrypoint Script).
 - `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`. NFD and GFD are disabled; the device plugin's default `nodeAffinity` (which requires `feature.node.kubernetes.io/pci-10de.present=true` or `nvidia.com/gpu.present=true` from NFD/GFD) is overridden to empty so the DaemonSet schedules on the single-node cluster without requiring those labels. The chart is configured with `deviceListStrategy: cdi-cri` so the device plugin injects devices via direct CDI device requests in the CRI.
 - k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.
 - The OpenShell Helm chart grants the gateway service account cluster-scoped read access to `node.k8s.io/runtimeclasses` and core `nodes` so GPU sandbox admission can verify both the `nvidia` `RuntimeClass` and allocatable GPU capacity before creating a sandbox.
@@ -323,6 +345,11 @@ The `--gpu` flag on `gateway start` enables GPU passthrough. OpenShell auto-sele
 Device injection uses CDI (`deviceListStrategy: cdi-cri`): the device plugin injects devices via direct CDI device requests in the CRI. Sandbox pods only need `nvidia.com/gpu: 1` in their resource limits, and GPU pods do not set `runtimeClassName`.
 
 The expected smoke test is a plain pod requesting `nvidia.com/gpu: 1` without `runtimeClassName` and running `nvidia-smi`.
+
+### WSL2 GPU specifics
+
+On WSL2 hosts, the GPU is exposed through `/dev/dxg` rather than native NVIDIA device nodes. In the case where the NVIDIA device plugin is configured to use a CDI-base device list strategy, the generated CDI spec (`/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json`) needs to be transformed to list a device with name `"0"` instead of `"all"`. The cluster entrypoint runs a background `inotifywait`-based watcher that detects these specs and writes a corrected version to `/var/run/cdi/openshell-wsl.json`. See [WSL2 CDI spec watcher](#wsl2-cdi-spec-watcher) for implementation details.
+
 
 ## Remote Image Transfer
 
