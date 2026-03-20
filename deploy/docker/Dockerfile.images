@@ -244,6 +244,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     mount \
     dnsutils \
+    inotify-tools \
+    jq \
     && apt-get install -y --only-upgrade gpgv \
     && rm -rf /var/lib/apt/lists/*
 
