@@ -26,9 +26,13 @@ mod ws_tunnel;
 use openshell_core::{Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
+use url::Url;
 
 use compute::ComputeRuntime;
 pub use grpc::OpenShellService;
@@ -40,6 +44,8 @@ use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
 pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
+
+const DEFAULT_COMPUTE_DRIVER_ENDPOINT: &str = "http://127.0.0.1:50061";
 
 /// Server state shared across handlers.
 #[derive(Debug)]
@@ -107,6 +113,53 @@ impl ServerState {
     }
 }
 
+#[derive(Debug)]
+struct ManagedComputeDriver {
+    child: Child,
+}
+
+impl ManagedComputeDriver {
+    fn spawn(binary: &Path, bind_address: SocketAddr, config: &Config) -> Result<Self> {
+        let mut command = Command::new(binary);
+        command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .env("OPENSHELL_COMPUTE_DRIVER_BIND", bind_address.to_string())
+            .env("OPENSHELL_GRPC_ENDPOINT", &config.grpc_endpoint)
+            .env("OPENSHELL_LOG_LEVEL", &config.log_level)
+            .env(
+                "OPENSHELL_SSH_HANDSHAKE_SECRET",
+                &config.ssh_handshake_secret,
+            )
+            .env(
+                "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
+                config.ssh_handshake_skew_secs.to_string(),
+            );
+
+        if let Some(tls) = &config.tls {
+            command
+                .env("OPENSHELL_TLS_CA", &tls.client_ca_path)
+                .env("OPENSHELL_TLS_CERT", &tls.cert_path)
+                .env("OPENSHELL_TLS_KEY", &tls.key_path);
+        }
+
+        let child = command.spawn().map_err(|e| {
+            Error::execution(format!(
+                "failed to spawn compute driver '{}': {e}",
+                binary.display()
+            ))
+        })?;
+        Ok(Self { child })
+    }
+}
+
+impl Drop for ManagedComputeDriver {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Run the `OpenShell` server.
 ///
 /// This starts a multiplexed gRPC/HTTP server on the configured bind address.
@@ -129,26 +182,50 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
-    let compute = ComputeRuntime::new_kubernetes(
-        KubernetesComputeConfig {
-            namespace: config.sandbox_namespace.clone(),
-            default_image: config.sandbox_image.clone(),
-            image_pull_policy: config.sandbox_image_pull_policy.clone(),
-            grpc_endpoint: config.grpc_endpoint.clone(),
-            ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
-            ssh_port: config.sandbox_ssh_port,
-            ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-            ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
-            client_tls_secret_name: config.client_tls_secret_name.clone(),
-            host_gateway_ip: config.host_gateway_ip.clone(),
-        },
-        store.clone(),
-        sandbox_index.clone(),
-        sandbox_watch_bus.clone(),
-        tracing_log_bus.clone(),
-    )
-    .await
-    .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+    let compute_driver_endpoint = effective_compute_driver_endpoint(&config)?;
+    let _managed_compute_driver = if let Some(binary) = config.compute_driver_bin.as_deref() {
+        let bind_address = compute_driver_bind_address(
+            compute_driver_endpoint
+                .as_deref()
+                .expect("compute driver endpoint is set when launching a managed driver"),
+        )?;
+        Some(ManagedComputeDriver::spawn(binary, bind_address, &config)?)
+    } else {
+        None
+    };
+
+    let compute = if let Some(endpoint) = compute_driver_endpoint.as_deref() {
+        ComputeRuntime::new_grpc(
+            endpoint,
+            store.clone(),
+            sandbox_index.clone(),
+            sandbox_watch_bus.clone(),
+            tracing_log_bus.clone(),
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
+    } else {
+        ComputeRuntime::new_kubernetes(
+            KubernetesComputeConfig {
+                namespace: config.sandbox_namespace.clone(),
+                default_image: config.sandbox_image.clone(),
+                image_pull_policy: config.sandbox_image_pull_policy.clone(),
+                grpc_endpoint: config.grpc_endpoint.clone(),
+                ssh_listen_addr: format!("0.0.0.0:{}", config.sandbox_ssh_port),
+                ssh_port: config.sandbox_ssh_port,
+                ssh_handshake_secret: config.ssh_handshake_secret.clone(),
+                ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
+                client_tls_secret_name: config.client_tls_secret_name.clone(),
+                host_gateway_ip: config.host_gateway_ip.clone(),
+            },
+            store.clone(),
+            sandbox_index.clone(),
+            sandbox_watch_bus.clone(),
+            tracing_log_bus.clone(),
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?
+    };
     let state = Arc::new(ServerState::new(
         config.clone(),
         store.clone(),
@@ -224,10 +301,43 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     }
 }
 
+fn effective_compute_driver_endpoint(config: &Config) -> Result<Option<String>> {
+    if !config.compute_driver_endpoint.trim().is_empty() {
+        return Ok(Some(config.compute_driver_endpoint.clone()));
+    }
+    if config.compute_driver_bin.is_some() {
+        return Ok(Some(DEFAULT_COMPUTE_DRIVER_ENDPOINT.to_string()));
+    }
+    Ok(None)
+}
+
+fn compute_driver_bind_address(endpoint: &str) -> Result<SocketAddr> {
+    let parsed = Url::parse(endpoint)
+        .map_err(|e| Error::config(format!("invalid compute driver endpoint '{endpoint}': {e}")))?;
+    let host = parsed.host_str().ok_or_else(|| {
+        Error::config(format!(
+            "compute driver endpoint '{endpoint}' must include a host"
+        ))
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        Error::config(format!(
+            "compute driver endpoint '{endpoint}' must include a port"
+        ))
+    })?;
+    format!("{host}:{port}")
+        .parse()
+        .map_err(|e| Error::config(format!("invalid compute driver bind address: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_benign_tls_handshake_failure;
+    use super::{
+        DEFAULT_COMPUTE_DRIVER_ENDPOINT, compute_driver_bind_address,
+        effective_compute_driver_endpoint, is_benign_tls_handshake_failure,
+    };
+    use openshell_core::Config;
     use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
 
     #[test]
     fn classifies_probe_style_tls_disconnects_as_benign() {
@@ -247,5 +357,22 @@ mod tests {
             let error = Error::new(kind, "real tls failure");
             assert!(!is_benign_tls_handshake_failure(&error));
         }
+    }
+
+    #[test]
+    fn managed_compute_driver_defaults_endpoint() {
+        let config = Config::new(None).with_compute_driver_bin(PathBuf::from("/tmp/driver"));
+        assert_eq!(
+            effective_compute_driver_endpoint(&config).unwrap(),
+            Some(DEFAULT_COMPUTE_DRIVER_ENDPOINT.to_string())
+        );
+    }
+
+    #[test]
+    fn compute_driver_bind_address_uses_host_and_port() {
+        assert_eq!(
+            compute_driver_bind_address("http://127.0.0.1:50061").unwrap(),
+            "127.0.0.1:50061".parse().unwrap()
+        );
     }
 }

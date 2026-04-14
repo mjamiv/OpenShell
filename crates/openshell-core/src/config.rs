@@ -84,6 +84,14 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// External compute-driver gRPC endpoint.
+    #[serde(default)]
+    pub compute_driver_endpoint: String,
+
+    /// External compute-driver binary managed by the gateway.
+    #[serde(default)]
+    pub compute_driver_bin: Option<PathBuf>,
 }
 
 /// TLS configuration.
@@ -133,6 +141,8 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            compute_driver_endpoint: String::new(),
+            compute_driver_bin: None,
         }
     }
 
@@ -245,6 +255,20 @@ impl Config {
     #[must_use]
     pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
         self.host_gateway_ip = ip.into();
+        self
+    }
+
+    /// Set the external compute-driver endpoint.
+    #[must_use]
+    pub fn with_compute_driver_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.compute_driver_endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the external compute-driver binary path.
+    #[must_use]
+    pub fn with_compute_driver_bin(mut self, path: PathBuf) -> Self {
+        self.compute_driver_bin = Some(path);
         self
     }
 }

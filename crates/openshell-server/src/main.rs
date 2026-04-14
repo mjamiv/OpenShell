@@ -97,6 +97,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    /// External compute-driver gRPC endpoint.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_ENDPOINT")]
+    compute_driver_endpoint: Option<String>,
+
+    /// External compute-driver binary managed by the gateway.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_BIN")]
+    compute_driver_bin: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -186,6 +194,14 @@ async fn main() -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    if let Some(endpoint) = args.compute_driver_endpoint {
+        config = config.with_compute_driver_endpoint(endpoint);
+    }
+
+    if let Some(path) = args.compute_driver_bin {
+        config = config.with_compute_driver_bin(path);
     }
 
     if args.disable_tls {

@@ -9,9 +9,17 @@ use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use openshell_core::proto::compute::v1::{
+    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
+    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    ResolveSandboxEndpointRequest, ResolveSandboxEndpointResponse, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    sandbox_endpoint, watch_sandboxes_event,
+};
 use openshell_core::proto::{
-    ResolveSandboxEndpointResponse, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec,
-    SandboxStatus, SshSession, WatchSandboxesEvent,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
+    SandboxTemplate, SshSession,
 };
 use openshell_driver_kubernetes::{
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesDriverError,
@@ -23,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::Status;
+use tonic::transport::{Channel, Endpoint};
 use tracing::{info, warn};
 
 type ComputeWatchStream =
@@ -48,6 +57,16 @@ impl From<KubernetesDriverError> for ComputeError {
     }
 }
 
+impl From<Status> for ComputeError {
+    fn from(value: Status) -> Self {
+        match value.code() {
+            tonic::Code::AlreadyExists => Self::AlreadyExists,
+            tonic::Code::FailedPrecondition => Self::Precondition(value.message().to_string()),
+            _ => Self::Message(value.to_string()),
+        }
+    }
+}
+
 pub enum ResolvedEndpoint {
     Ip(IpAddr, u16),
     Host(String, u16),
@@ -56,12 +75,12 @@ pub enum ResolvedEndpoint {
 #[tonic::async_trait]
 pub trait ComputeBackend: fmt::Debug + Send + Sync {
     fn default_image(&self) -> &str;
-    async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status>;
-    async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), ComputeError>;
+    async fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), Status>;
+    async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeError>;
     async fn delete_sandbox(&self, sandbox_name: &str) -> Result<bool, ComputeError>;
     async fn resolve_sandbox_endpoint(
         &self,
-        sandbox: &Sandbox,
+        sandbox: &DriverSandbox,
     ) -> Result<ResolvedEndpoint, ComputeError>;
     async fn watch_sandboxes(&self) -> Result<ComputeWatchStream, ComputeError>;
 }
@@ -84,11 +103,11 @@ impl ComputeBackend for InProcessKubernetesBackend {
         self.driver.default_image()
     }
 
-    async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+    async fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
         self.driver.validate_sandbox_create(sandbox).await
     }
 
-    async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), ComputeError> {
+    async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeError> {
         self.driver
             .create_sandbox(sandbox)
             .await
@@ -104,13 +123,13 @@ impl ComputeBackend for InProcessKubernetesBackend {
 
     async fn resolve_sandbox_endpoint(
         &self,
-        sandbox: &Sandbox,
+        sandbox: &DriverSandbox,
     ) -> Result<ResolvedEndpoint, ComputeError> {
         let response = self
             .driver
             .resolve_sandbox_endpoint(sandbox)
             .await
-            .map_err(ComputeError::Message)?;
+            .map_err(ComputeError::from)?;
         resolved_endpoint_from_response(&response)
     }
 
@@ -121,6 +140,94 @@ impl ComputeBackend for InProcessKubernetesBackend {
             .await
             .map_err(ComputeError::Message)?;
         Ok(Box::pin(stream.map(|item| item.map_err(Into::into))))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GrpcComputeBackend {
+    client: ComputeDriverClient<Channel>,
+    capabilities: GetCapabilitiesResponse,
+}
+
+impl GrpcComputeBackend {
+    pub async fn connect(endpoint: &str) -> Result<Self, ComputeError> {
+        let client = connect_compute_driver(endpoint).await?;
+        let mut capabilities_client = client.clone();
+        let capabilities = capabilities_client
+            .get_capabilities(GetCapabilitiesRequest {})
+            .await
+            .map_err(ComputeError::from)?
+            .into_inner();
+        Ok(Self {
+            client,
+            capabilities,
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl ComputeBackend for GrpcComputeBackend {
+    fn default_image(&self) -> &str {
+        &self.capabilities.default_image
+    }
+
+    async fn validate_sandbox_create(&self, sandbox: &DriverSandbox) -> Result<(), Status> {
+        let mut client = self.client.clone();
+        client
+            .validate_sandbox_create(ValidateSandboxCreateRequest {
+                sandbox: Some(sandbox.clone()),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeError> {
+        let mut client = self.client.clone();
+        client
+            .create_sandbox(CreateSandboxRequest {
+                sandbox: Some(sandbox.clone()),
+            })
+            .await
+            .map_err(ComputeError::from)?;
+        Ok(())
+    }
+
+    async fn delete_sandbox(&self, sandbox_name: &str) -> Result<bool, ComputeError> {
+        let mut client = self.client.clone();
+        client
+            .delete_sandbox(DeleteSandboxRequest {
+                sandbox_id: String::new(),
+                sandbox_name: sandbox_name.to_string(),
+            })
+            .await
+            .map_err(ComputeError::from)
+            .map(|response| response.into_inner().deleted)
+    }
+
+    async fn resolve_sandbox_endpoint(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<ResolvedEndpoint, ComputeError> {
+        let mut client = self.client.clone();
+        let response = client
+            .resolve_sandbox_endpoint(ResolveSandboxEndpointRequest {
+                sandbox: Some(sandbox.clone()),
+            })
+            .await
+            .map_err(ComputeError::from)?
+            .into_inner();
+        resolved_endpoint_from_response(&response)
+    }
+
+    async fn watch_sandboxes(&self) -> Result<ComputeWatchStream, ComputeError> {
+        let mut client = self.client.clone();
+        let stream = client
+            .watch_sandboxes(WatchSandboxesRequest {})
+            .await
+            .map_err(ComputeError::from)?
+            .into_inner()
+            .map(|item| item.map_err(ComputeError::from));
+        Ok(Box::pin(stream))
     }
 }
 
@@ -159,13 +266,31 @@ impl ComputeRuntime {
         })
     }
 
+    pub async fn new_grpc(
+        endpoint: &str,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+    ) -> Result<Self, ComputeError> {
+        let backend = GrpcComputeBackend::connect(endpoint).await?;
+        Ok(Self {
+            backend: Arc::new(backend),
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+        })
+    }
+
     #[must_use]
     pub fn default_image(&self) -> &str {
         self.backend.default_image()
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        self.backend.validate_sandbox_create(sandbox).await
+        let driver_sandbox = driver_sandbox_from_public(sandbox);
+        self.backend.validate_sandbox_create(&driver_sandbox).await
     }
 
     pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
@@ -187,7 +312,8 @@ impl ComputeRuntime {
             .await
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
 
-        match self.backend.create_sandbox(&sandbox).await {
+        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        match self.backend.create_sandbox(&driver_sandbox).await {
             Ok(()) => {
                 self.sandbox_watch_bus.notify(&sandbox.id);
                 Ok(sandbox)
@@ -278,8 +404,9 @@ impl ComputeRuntime {
         &self,
         sandbox: &Sandbox,
     ) -> Result<ResolvedEndpoint, Status> {
+        let driver_sandbox = driver_sandbox_from_public(sandbox);
         self.backend
-            .resolve_sandbox_endpoint(sandbox)
+            .resolve_sandbox_endpoint(&driver_sandbox)
             .await
             .map_err(|err| match err {
                 ComputeError::Precondition(message) => Status::failed_precondition(message),
@@ -329,24 +456,24 @@ impl ComputeRuntime {
     }
 
     async fn apply_watch_event(&self, event: WatchSandboxesEvent) -> Result<(), String> {
-        use openshell_core::proto::watch_sandboxes_event::Payload;
-
         match event.payload {
-            Some(Payload::Sandbox(sandbox)) => {
+            Some(watch_sandboxes_event::Payload::Sandbox(sandbox)) => {
                 if let Some(sandbox) = sandbox.sandbox {
                     self.apply_sandbox_update(sandbox).await?;
                 }
             }
-            Some(Payload::Deleted(deleted)) => {
+            Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
                 self.apply_deleted(&deleted.sandbox_id).await?;
             }
-            Some(Payload::PlatformEvent(platform_event)) => {
+            Some(watch_sandboxes_event::Payload::PlatformEvent(platform_event)) => {
                 if let Some(event) = platform_event.event {
                     self.tracing_log_bus.platform_event_bus.publish(
                         &platform_event.sandbox_id,
                         openshell_core::proto::SandboxStreamEvent {
                             payload: Some(
-                                openshell_core::proto::sandbox_stream_event::Payload::Event(event),
+                                openshell_core::proto::sandbox_stream_event::Payload::Event(
+                                    public_platform_event_from_driver(&event),
+                                ),
                             ),
                         },
                     );
@@ -357,20 +484,20 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn apply_sandbox_update(&self, incoming: Sandbox) -> Result<(), String> {
+    async fn apply_sandbox_update(&self, incoming: DriverSandbox) -> Result<(), String> {
         let existing = self
             .store
             .get_message::<Sandbox>(&incoming.id)
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut status = incoming.status.clone();
+        let mut status = incoming.status.as_ref().map(public_status_from_driver);
         rewrite_user_facing_conditions(
             &mut status,
             existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
         );
 
-        let phase = SandboxPhase::try_from(incoming.phase).unwrap_or(SandboxPhase::Unknown);
+        let mut phase = derive_phase(incoming.status.as_ref());
         let mut sandbox = existing.unwrap_or_else(|| Sandbox {
             id: incoming.id.clone(),
             name: incoming.name.clone(),
@@ -382,6 +509,9 @@ impl ComputeRuntime {
         });
 
         let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+        if old_phase == SandboxPhase::Deleting && phase != SandboxPhase::Error {
+            phase = SandboxPhase::Deleting;
+        }
         if old_phase != phase {
             info!(
                 sandbox_id = %incoming.id,
@@ -398,7 +528,7 @@ impl ComputeRuntime {
             for condition in &status.conditions {
                 if condition.r#type == "Ready"
                     && condition.status.eq_ignore_ascii_case("false")
-                    && is_terminal_failure_condition(condition)
+                    && is_terminal_failure_reason(&condition.reason)
                 {
                     warn!(
                         sandbox_id = %incoming.id,
@@ -444,6 +574,174 @@ impl ComputeRuntime {
     }
 }
 
+fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
+    DriverSandbox {
+        id: sandbox.id.clone(),
+        name: sandbox.name.clone(),
+        namespace: sandbox.namespace.clone(),
+        spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
+        status: sandbox
+            .status
+            .as_ref()
+            .map(|status| driver_status_from_public(status, sandbox.phase)),
+    }
+}
+
+fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
+    DriverSandboxSpec {
+        log_level: spec.log_level.clone(),
+        environment: spec.environment.clone(),
+        template: spec
+            .template
+            .as_ref()
+            .map(driver_sandbox_template_from_public),
+        gpu: spec.gpu,
+    }
+}
+
+fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
+    DriverSandboxTemplate {
+        image: template.image.clone(),
+        agent_socket_path: template.agent_socket.clone(),
+        labels: template.labels.clone(),
+        environment: template.environment.clone(),
+        resources: extract_typed_resources(&template.resources),
+        platform_config: build_platform_config(template),
+    }
+}
+
+/// Extract typed CPU/memory quantities from the public `resources` Struct.
+///
+/// The public API exposes resources as an untyped `google.protobuf.Struct`
+/// with the Kubernetes limits/requests shape. We pull out the well-known
+/// keys into the typed `DriverResourceRequirements` message.
+fn extract_typed_resources(
+    resources: &Option<prost_types::Struct>,
+) -> Option<DriverResourceRequirements> {
+    let resources = resources.as_ref()?;
+
+    fn get_quantity(resources: &prost_types::Struct, section: &str, key: &str) -> String {
+        resources
+            .fields
+            .get(section)
+            .and_then(|value| match value.kind.as_ref() {
+                Some(prost_types::value::Kind::StructValue(inner)) => inner.fields.get(key),
+                _ => None,
+            })
+            .and_then(|value| match value.kind.as_ref() {
+                Some(prost_types::value::Kind::StringValue(quantity)) => Some(quantity.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    let requirements = DriverResourceRequirements {
+        cpu_request: get_quantity(resources, "requests", "cpu"),
+        cpu_limit: get_quantity(resources, "limits", "cpu"),
+        memory_request: get_quantity(resources, "requests", "memory"),
+        memory_limit: get_quantity(resources, "limits", "memory"),
+    };
+
+    if requirements.cpu_request.is_empty()
+        && requirements.cpu_limit.is_empty()
+        && requirements.memory_request.is_empty()
+        && requirements.memory_limit.is_empty()
+    {
+        None
+    } else {
+        Some(requirements)
+    }
+}
+
+/// Build the opaque `platform_config` Struct from platform-specific public
+/// template fields plus the raw resources payload.
+fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let mut fields = std::collections::BTreeMap::new();
+
+    if !template.runtime_class_name.is_empty() {
+        fields.insert(
+            "runtime_class_name".to_string(),
+            Value {
+                kind: Some(Kind::StringValue(template.runtime_class_name.clone())),
+            },
+        );
+    }
+
+    if !template.annotations.is_empty() {
+        let annotation_fields = template
+            .annotations
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    Value {
+                        kind: Some(Kind::StringValue(value.clone())),
+                    },
+                )
+            })
+            .collect();
+        fields.insert(
+            "annotations".to_string(),
+            Value {
+                kind: Some(Kind::StructValue(Struct {
+                    fields: annotation_fields,
+                })),
+            },
+        );
+    }
+
+    if let Some(volume_claim_templates) = &template.volume_claim_templates {
+        fields.insert(
+            "volume_claim_templates".to_string(),
+            Value {
+                kind: Some(Kind::StructValue(volume_claim_templates.clone())),
+            },
+        );
+    }
+
+    if let Some(resources) = &template.resources {
+        fields.insert(
+            "resources_raw".to_string(),
+            Value {
+                kind: Some(Kind::StructValue(resources.clone())),
+            },
+        );
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(Struct { fields })
+    }
+}
+
+fn driver_status_from_public(status: &SandboxStatus, phase: i32) -> DriverSandboxStatus {
+    DriverSandboxStatus {
+        sandbox_name: status.sandbox_name.clone(),
+        instance_id: status.agent_pod.clone(),
+        agent_fd: status.agent_fd.clone(),
+        sandbox_fd: status.sandbox_fd.clone(),
+        conditions: status
+            .conditions
+            .iter()
+            .map(driver_condition_from_public)
+            .collect(),
+        deleting: SandboxPhase::try_from(phase) == Ok(SandboxPhase::Deleting),
+    }
+}
+
+fn driver_condition_from_public(condition: &SandboxCondition) -> DriverCondition {
+    DriverCondition {
+        r#type: condition.r#type.clone(),
+        status: condition.status.clone(),
+        reason: condition.reason.clone(),
+        message: condition.message.clone(),
+        last_transition_time: condition.last_transition_time.clone(),
+    }
+}
+
 impl ObjectType for Sandbox {
     fn object_type() -> &'static str {
         "sandbox"
@@ -473,17 +771,104 @@ fn resolved_endpoint_from_response(
         .map_err(|_| ComputeError::Message("compute driver returned invalid port".to_string()))?;
 
     match endpoint.target.as_ref() {
-        Some(openshell_core::proto::sandbox_endpoint::Target::Ip(ip)) => ip
+        Some(sandbox_endpoint::Target::Ip(ip)) => ip
             .parse()
             .map(|ip| ResolvedEndpoint::Ip(ip, port))
             .map_err(|e| ComputeError::Message(format!("invalid endpoint IP: {e}"))),
-        Some(openshell_core::proto::sandbox_endpoint::Target::Host(host)) => {
+        Some(sandbox_endpoint::Target::Host(host)) => {
             Ok(ResolvedEndpoint::Host(host.clone(), port))
         }
         None => Err(ComputeError::Message(
             "compute driver returned endpoint without target".to_string(),
         )),
     }
+}
+
+async fn connect_compute_driver(
+    endpoint: &str,
+) -> Result<ComputeDriverClient<Channel>, ComputeError> {
+    let endpoint = Endpoint::from_shared(endpoint.to_string())
+        .map_err(|err| ComputeError::Message(format!("invalid compute driver endpoint: {err}")))?;
+
+    let mut last_error = None;
+    for _ in 0..20 {
+        match endpoint.clone().connect().await {
+            Ok(channel) => return Ok(ComputeDriverClient::new(channel)),
+            Err(err) => {
+                last_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    let error = last_error
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "unknown error".to_string());
+    Err(ComputeError::Message(format!(
+        "connect compute driver failed: {error}"
+    )))
+}
+
+fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
+    SandboxStatus {
+        sandbox_name: status.sandbox_name.clone(),
+        agent_pod: status.instance_id.clone(),
+        agent_fd: status.agent_fd.clone(),
+        sandbox_fd: status.sandbox_fd.clone(),
+        conditions: status
+            .conditions
+            .iter()
+            .map(public_condition_from_driver)
+            .collect(),
+    }
+}
+
+fn public_condition_from_driver(condition: &DriverCondition) -> SandboxCondition {
+    SandboxCondition {
+        r#type: condition.r#type.clone(),
+        status: condition.status.clone(),
+        reason: condition.reason.clone(),
+        message: condition.message.clone(),
+        last_transition_time: condition.last_transition_time.clone(),
+    }
+}
+
+fn public_platform_event_from_driver(event: &DriverPlatformEvent) -> PlatformEvent {
+    PlatformEvent {
+        timestamp_ms: event.timestamp_ms,
+        source: event.source.clone(),
+        r#type: event.r#type.clone(),
+        reason: event.reason.clone(),
+        message: event.message.clone(),
+        metadata: event.metadata.clone(),
+    }
+}
+
+fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
+    if let Some(status) = status {
+        if status.deleting {
+            return SandboxPhase::Deleting;
+        }
+
+        for condition in &status.conditions {
+            if condition.r#type == "Ready" {
+                return if condition.status.eq_ignore_ascii_case("true") {
+                    SandboxPhase::Ready
+                } else if condition.status.eq_ignore_ascii_case("false") {
+                    if is_terminal_failure_reason(&condition.reason) {
+                        SandboxPhase::Error
+                    } else {
+                        SandboxPhase::Provisioning
+                    }
+                } else {
+                    SandboxPhase::Provisioning
+                };
+            }
+        }
+        return SandboxPhase::Provisioning;
+    }
+
+    SandboxPhase::Unknown
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
@@ -504,8 +889,202 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
-fn is_terminal_failure_condition(condition: &SandboxCondition) -> bool {
-    let reason = condition.reason.to_ascii_lowercase();
-    let transient_reasons = ["reconcilererror", "dependenciesnotready"];
+fn is_terminal_failure_reason(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    let transient_reasons = ["reconcilererror", "dependenciesnotready", "starting"];
     !transient_reasons.contains(&reason.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_driver_condition(reason: &str, message: &str) -> DriverCondition {
+        DriverCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+            last_transition_time: String::new(),
+        }
+    }
+
+    fn make_driver_status(condition: DriverCondition) -> DriverSandboxStatus {
+        DriverSandboxStatus {
+            sandbox_name: "test".to_string(),
+            instance_id: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![condition],
+            deleting: false,
+        }
+    }
+
+    #[test]
+    fn terminal_failure_treats_unknown_reasons_as_terminal() {
+        let terminal_cases = [
+            ("Failed", "Something went wrong"),
+            ("CrashLoopBackOff", "Container keeps crashing"),
+            ("ImagePullBackOff", "Failed to pull image"),
+            ("ErrImagePull", "Error pulling image"),
+            ("Unschedulable", "No nodes match"),
+            ("SomeOtherReason", "Any other reason is terminal"),
+        ];
+
+        for (reason, message) in terminal_cases {
+            assert!(
+                is_terminal_failure_reason(reason),
+                "Expected terminal failure for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_ignores_transient_reasons() {
+        let transient_cases = [
+            (
+                "ReconcilerError",
+                "Error seen: failed to update pod: Operation cannot be fulfilled",
+            ),
+            ("reconcilererror", "lowercase also works"),
+            ("RECONCILERERROR", "uppercase also works"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+            ("dependenciesnotready", "lowercase also works"),
+            ("Starting", "VM is starting"),
+        ];
+
+        for (reason, message) in transient_cases {
+            assert!(
+                !is_terminal_failure_reason(reason),
+                "Expected transient (non-terminal) for reason={reason}, message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_unknown_without_status() {
+        assert_eq!(derive_phase(None), SandboxPhase::Unknown);
+    }
+
+    #[test]
+    fn derive_phase_returns_deleting_when_driver_marks_deleting() {
+        let status = DriverSandboxStatus {
+            deleting: true,
+            ..make_driver_status(make_driver_condition(
+                "DependenciesNotReady",
+                "Pod still pending",
+            ))
+        };
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Deleting);
+    }
+
+    #[test]
+    fn derive_phase_returns_provisioning_for_transient_conditions() {
+        let transient_conditions = [
+            ("ReconcilerError", "Error seen: failed to update pod"),
+            (
+                "DependenciesNotReady",
+                "Pod exists with phase: Pending; Service Exists",
+            ),
+            ("Starting", "VM is starting"),
+        ];
+
+        for (reason, message) in transient_conditions {
+            let status = make_driver_status(make_driver_condition(reason, message));
+            assert_eq!(
+                derive_phase(Some(&status)),
+                SandboxPhase::Provisioning,
+                "Expected Provisioning for transient reason={reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_phase_returns_error_for_terminal_ready_false() {
+        let status = make_driver_status(make_driver_condition(
+            "ImagePullBackOff",
+            "Failed to pull image",
+        ));
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Error);
+    }
+
+    #[test]
+    fn derive_phase_returns_ready_for_ready_true() {
+        let status = DriverSandboxStatus {
+            conditions: vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Pod is Ready; Service Exists".to_string(),
+                last_transition_time: String::new(),
+            }],
+            ..make_driver_status(make_driver_condition("", ""))
+        };
+
+        assert_eq!(derive_phase(Some(&status)), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: true,
+                ..Default::default()
+            }),
+        );
+
+        let message = &status.unwrap().conditions[0].message;
+        assert_eq!(
+            message,
+            "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration."
+        );
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_leaves_non_gpu_unschedulable_message_unchanged() {
+        let original = "0/1 nodes are available: 1 Insufficient cpu.";
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: original.to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: false,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(status.unwrap().conditions[0].message, original);
+    }
 }

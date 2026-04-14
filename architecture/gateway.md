@@ -72,6 +72,7 @@ graph TD
 | Persistence: Postgres | `crates/openshell-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
 | Compute runtime | `crates/openshell-server/src/compute/mod.rs` | `ComputeRuntime`, gateway-owned sandbox lifecycle orchestration over a compute backend |
 | Compute driver: Kubernetes | `crates/openshell-driver-kubernetes/src/driver.rs` | Kubernetes CRD create/delete, endpoint resolution, watch stream, pod template translation |
+| Compute driver: VM | `crates/openshell-driver-vm/src/driver.rs` | Per-sandbox microVM create/delete, localhost endpoint resolution, watch stream, supervisor-only guest boot |
 | Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
 | Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus` -- in-memory broadcast for persisted sandbox updates |
 | Tracing bus | `crates/openshell-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
@@ -96,7 +97,9 @@ The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and procee
 4. **Build `Config`** -- Assembles a `openshell_core::Config` from the parsed arguments.
 5. **Call `run_server()`** (`crates/openshell-server/src/lib.rs`):
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
-   2. Create `ComputeRuntime` with the in-process Kubernetes compute backend (`KubernetesComputeDriver`).
+  2. Create `ComputeRuntime` with either:
+     - the in-process Kubernetes compute backend (`KubernetesComputeDriver`), or
+     - an external `ComputeDriver` gRPC backend reached through `OPENSHELL_COMPUTE_DRIVER_ENDPOINT`. When `OPENSHELL_COMPUTE_DRIVER_BIN` is set, `run_server()` launches that binary first and then connects to it over gRPC.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
    4. **Spawn background tasks**:
       - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, updates persisted sandbox records, and republishes platform events.
@@ -123,6 +126,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
+| `--compute-driver-endpoint` | `OPENSHELL_COMPUTE_DRIVER_ENDPOINT` | None | External compute-driver gRPC endpoint. When set, the gateway uses this instead of the in-process Kubernetes backend. |
+| `--compute-driver-bin` | `OPENSHELL_COMPUTE_DRIVER_BIN` | None | External compute-driver binary to launch before connecting to `OPENSHELL_COMPUTE_DRIVER_ENDPOINT`. Defaults to `http://127.0.0.1:50061` when only the binary is set. |
 | `--ssh-gateway-host` | `OPENSHELL_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
 | `--ssh-gateway-port` | `OPENSHELL_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
 | `--ssh-connect-path` | `OPENSHELL_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
@@ -538,6 +543,16 @@ The Kubernetes driver also watches namespace-scoped Kubernetes `Event` objects a
 - Other event kinds are ignored.
 
 Matched events are published to the `PlatformEventBus` as `SandboxStreamEvent::Event` payloads.
+
+## VM Driver
+
+`VmDriver` (`crates/openshell-driver-vm/src/driver.rs`) is an external compute driver that gives each sandbox its own libkrun-backed microVM.
+
+- **Create**: Allocates a localhost SSH port, prepares a sandbox-specific rootfs from `openshell-vm`, injects guest TLS material when the gateway callback endpoint is `https://`, and launches `openshell-vm` with `--exec /srv/openshell-vm-sandbox-init.sh`.
+- **Gateway callback**: The VM guest cannot reach the host via `127.0.0.1` or `localhost`; local development should use a gvproxy guest-visible host alias such as `host.containers.internal` for `OPENSHELL_GRPC_ENDPOINT`.
+- **Guest boot**: The sandbox guest runs a minimal init script that skips k3s and starts `openshell-sandbox` directly as PID 1 inside the VM.
+- **Endpoint resolution**: Returns `127.0.0.1:<allocated-port>` for SSH/exec transport.
+- **Watch stream**: Emits provisioning, ready, error, deleting, deleted, and platform-event updates so the gateway store remains the durable source of truth.
 
 ## Sandbox Index
 

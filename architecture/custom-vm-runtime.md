@@ -80,6 +80,14 @@ The embedded rootfs uses a "minimal" configuration:
 Container images are pulled on demand when sandboxes are created. First boot takes
 ~30-60s as k3s initializes; subsequent boots use cached state for ~3-5s startup.
 
+For the VM compute driver, the same embedded rootfs is rewritten into a
+supervisor-only sandbox guest before boot:
+
+- removes k3s state and Kubernetes manifests from the extracted rootfs
+- installs `/srv/openshell-vm-sandbox-init.sh`
+- boots directly into `openshell-sandbox` instead of `openshell-vm-init.sh`
+- keeps the same embedded libkrun/libkrunfw kernel/runtime bundle
+
 For fully air-gapped environments requiring pre-loaded images, build with:
 ```bash
 mise run vm:rootfs                 # Full rootfs (~2GB, includes images)
