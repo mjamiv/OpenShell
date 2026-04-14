@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: GPU VM Passthrough CI
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: read
+  packages: write
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - id: get_pr_info
+        if: github.event_name == 'push'
+        continue-on-error: true
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf
+
+      - id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          GET_PR_INFO_OUTCOME: ${{ steps.get_pr_info.outcome }}
+          PR_INFO: ${{ steps.get_pr_info.outputs.pr-info }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "push" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GET_PR_INFO_OUTCOME" != "success" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          head_sha="$(jq -r '.head.sha' <<< "$PR_INFO")"
+          has_label="$(jq -r '[.labels[].name] | index("test:vm-gpu") != null' <<< "$PR_INFO")"
+
+          if [ "$head_sha" = "$GITHUB_SHA_VALUE" ] && [ "$has_label" = "true" ]; then
+            should_run=true
+          else
+            should_run=false
+          fi
+
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
+  gpu-passthrough-test:
+    name: "GPU Passthrough (${{ matrix.name }})"
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-arm64
+            runner: linux-arm64-gpu-l4-latest-1
+          - name: linux-amd64
+            runner: linux-amd64-gpu-rtxpro6000-latest-1
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_VM_GPU_E2E: "1"
+      # Match `configured_runtime_dir()` / embedded cache layout so GPU gate and CHV tests see cloud-hypervisor.
+      OPENSHELL_VM_RUNTIME_DIR: ${{ github.workspace }}/target/debug/openshell-vm.runtime
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Configure sccache remote cache
+        if: vars.SCCACHE_MEMCACHED_ENDPOINT != ''
+        run: echo "SCCACHE_MEMCACHED_ENDPOINT=${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}" >> "$GITHUB_ENV"
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: gpu-ci-${{ matrix.name }}
+          cache-directories: .cache/sccache
+
+      - name: Build VM runtime
+        run: mise run vm:build
+
+      - name: Run GPU passthrough gate test
+        run: cargo test -p openshell-vm --test gpu_passthrough_implementation -- --nocapture
+
+      - name: Run VM boot smoke test
+        env:
+          OPENSHELL_VM_BACKEND: cloud-hypervisor
+        run: cargo test -p openshell-vm --test vm_boot_smoke -- --nocapture
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+  build-gateway:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+
+  build-cluster:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
+  gpu-e2e:
+    name: GPU E2E
+    needs: [pr_metadata, build-gateway, build-cluster]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    uses: ./.github/workflows/e2e-gpu-test.yaml
+    with:
+      image-tag: ${{ github.sha }}

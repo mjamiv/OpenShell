@@ -92,6 +92,16 @@ struct Cli {
     /// unclean shutdown.
     #[arg(long)]
     reset: bool,
+
+    /// Enable GPU passthrough. Optionally specify a PCI address
+    /// (e.g. `0000:41:00.0`). Uses cloud-hypervisor backend with VFIO.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+    gpu: Option<String>,
+
+    /// Hypervisor backend: "auto" (default), "libkrun", or "cloud-hypervisor".
+    /// Auto selects cloud-hypervisor when --gpu is set, libkrun otherwise.
+    #[arg(long, default_value = "auto")]
+    backend: String,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +239,32 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
 
     let gateway_name = openshell_vm::gateway_name(&cli.name)?;
 
+    let (gpu_enabled, vfio_device, _gpu_guard) = match cli.gpu {
+        Some(ref addr) if addr != "auto" => {
+            let state = openshell_vm::gpu_passthrough::prepare_gpu_for_passthrough(Some(addr))?;
+            let bdf = state.pci_addr.clone();
+            (true, Some(bdf), Some(openshell_vm::gpu_passthrough::GpuBindGuard::new(state)))
+        }
+        Some(_) => {
+            let state = openshell_vm::gpu_passthrough::prepare_gpu_for_passthrough(None)?;
+            let bdf = state.pci_addr.clone();
+            (true, Some(bdf), Some(openshell_vm::gpu_passthrough::GpuBindGuard::new(state)))
+        }
+        None => (false, None, None),
+    };
+
+    let backend_choice = match cli.backend.as_str() {
+        "cloud-hypervisor" | "chv" => openshell_vm::VmBackendChoice::CloudHypervisor,
+        "libkrun" => openshell_vm::VmBackendChoice::Libkrun,
+        "auto" => openshell_vm::VmBackendChoice::Auto,
+        other => {
+            return Err(format!(
+                "unknown --backend: {other} (expected: auto, libkrun, cloud-hypervisor)"
+            )
+            .into());
+        }
+    };
+
     let mut config = if let Some(exec_path) = cli.exec {
         openshell_vm::VmConfig {
             rootfs,
@@ -246,6 +282,9 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             reset: cli.reset,
             gateway_name,
             state_disk: None,
+            gpu_enabled,
+            vfio_device,
+            backend: backend_choice,
         }
     } else {
         let mut c = openshell_vm::VmConfig::gateway(rootfs);
@@ -261,6 +300,9 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         c.net = net_backend;
         c.reset = cli.reset;
         c.gateway_name = gateway_name;
+        c.gpu_enabled = gpu_enabled;
+        c.vfio_device = vfio_device;
+        c.backend = backend_choice;
         if state_disk_disabled() {
             c.state_disk = None;
         }
