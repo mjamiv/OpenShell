@@ -516,7 +516,9 @@ async fn ssh_tar_upload(
                         .append_path_with_name(&local_path, &tar_name)
                         .into_diagnostic()?;
                 } else if local_path.is_dir() {
-                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
+                    archive
+                        .append_dir_all(&tar_name, &local_path)
+                        .into_diagnostic()?;
                 } else {
                     return Err(miette::miette!(
                         "local path does not exist: {}",
@@ -613,11 +615,18 @@ pub async fn sandbox_sync_up_files(
 /// that does not end with `/`, the destination is treated as a file path:
 /// the parent directory is created and the file is written with the
 /// destination's basename.  This matches `cp` / `scp` semantics.
+///
+/// When `preserve_dir_name` is `true` and `local_path` is a directory, its
+/// basename is wrapped as a subdirectory of `sandbox_path` (matches
+/// `scp -r` / `cp -r`). When `false` (default), the directory's contents are
+/// extracted flat into `sandbox_path` — the historical behavior, kept for
+/// backward compatibility.
 pub async fn sandbox_sync_up(
     server: &str,
     name: &str,
     local_path: &Path,
     sandbox_path: Option<&str>,
+    preserve_dir_name: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     // When an explicit destination is given and looks like a file path (does
@@ -653,8 +662,13 @@ pub async fn sandbox_sync_up(
             .file_name()
             .ok_or_else(|| miette::miette!("path has no file name"))?
             .to_os_string()
+    } else if preserve_dir_name {
+        // Wrap directory contents under their own basename so uploads land at
+        // `<dest>/<dirname>/...` (matches `scp -r` / `cp -r`). Falls back to
+        // "." for paths with no meaningful basename (`.`, `/`).
+        directory_upload_prefix(local_path)
     } else {
-        // For directories the tar_name is unused — append_dir_all uses "."
+        // Default: flatten directory contents into <dest>/ (legacy behavior).
         ".".into()
     };
 
@@ -669,6 +683,20 @@ pub async fn sandbox_sync_up(
         tls,
     )
     .await
+}
+
+/// Compute the tar entry prefix for a directory upload when
+/// `preserve_dir_name` is enabled.
+///
+/// Returns the directory's basename for any path with a meaningful basename;
+/// callers extracting at `<dest>` will see contents wrapped under
+/// `<dest>/<basename>/...`. Returns `"."` for paths without a basename
+/// (e.g. `.` or `/`), which produces flat extraction at `<dest>`.
+fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
+    local_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| ".".into())
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -1263,6 +1291,34 @@ mod tests {
             ("/sandbox/sub", "file")
         );
         assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn directory_upload_prefix_uses_basename_for_named_directories() {
+        assert_eq!(
+            directory_upload_prefix(Path::new("/tmp/upload-test")),
+            std::ffi::OsString::from("upload-test")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("foo")),
+            std::ffi::OsString::from("foo")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("./parent/nested")),
+            std::ffi::OsString::from("nested")
+        );
+    }
+
+    #[test]
+    fn directory_upload_prefix_falls_back_to_dot_for_basename_less_paths() {
+        assert_eq!(
+            directory_upload_prefix(Path::new(".")),
+            std::ffi::OsString::from(".")
+        );
+        assert_eq!(
+            directory_upload_prefix(Path::new("/")),
+            std::ffi::OsString::from(".")
+        );
     }
 
     #[test]

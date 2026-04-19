@@ -1298,6 +1298,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// NOTE: by default, uploading a directory extracts its contents flat into
+    /// the destination (legacy behavior). To match `scp -r` / `cp -r`
+    /// semantics — wrapping the contents under the source directory's name —
+    /// pass `--preserve-dir`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
@@ -1314,6 +1319,13 @@ enum SandboxCommands {
         /// Disable `.gitignore` filtering (uploads everything).
         #[arg(long)]
         no_git_ignore: bool,
+
+        /// When uploading a directory, wrap its contents under the source
+        /// directory's basename in the destination (matches `scp -r` / `cp -r`
+        /// semantics). Without this flag, contents are extracted flat into
+        /// the destination.
+        #[arg(long)]
+        preserve_dir: bool,
     },
 
     /// Download files from a sandbox.
@@ -2320,6 +2332,7 @@ async fn main() -> Result<()> {
                     local_path,
                     dest,
                     no_git_ignore,
+                    preserve_dir,
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
@@ -2348,7 +2361,15 @@ async fn main() -> Result<()> {
                         return Ok(());
                     }
                     // Fallback: upload without git filtering
-                    run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
+                    run::sandbox_sync_up(
+                        &ctx.endpoint,
+                        &name,
+                        local,
+                        sandbox_dest,
+                        preserve_dir,
+                        &tls,
+                    )
+                    .await?;
                     eprintln!("{} Upload complete", "✓".green().bold());
                 }
                 SandboxCommands::Download {

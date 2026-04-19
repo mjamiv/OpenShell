@@ -2413,6 +2413,7 @@ pub async fn sandbox_create(
                         &sandbox_name,
                         local,
                         dest,
+                        false,
                         &effective_tls,
                     )
                     .await?;
@@ -2710,7 +2711,7 @@ pub async fn sandbox_sync_command(
             }
             let dest_display = dest.unwrap_or("~");
             eprintln!("Syncing {} -> sandbox:{}", local.display(), dest_display);
-            sandbox_sync_up(server, name, local, dest, tls).await?;
+            sandbox_sync_up(server, name, local, dest, false, tls).await?;
             eprintln!("{} Sync complete", "✓".green().bold());
         }
         (None, Some(sandbox_path)) => {
