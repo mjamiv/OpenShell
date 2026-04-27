@@ -2348,12 +2348,23 @@ async fn main() -> Result<()> {
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
                     if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
+                        let tar_prefix = if preserve_dir && local.is_dir() {
+                            Some(
+                                local
+                                    .file_name()
+                                    .map(|n| n.to_os_string())
+                                    .unwrap_or_else(|| ".".into()),
+                            )
+                        } else {
+                            None
+                        };
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,
                             &base_dir,
                             &files,
                             sandbox_dest,
+                            tar_prefix,
                             &tls,
                         )
                         .await?;

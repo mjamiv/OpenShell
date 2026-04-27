@@ -17,6 +17,14 @@ Push a specific directory to a custom destination:
 openshell sandbox upload my-sandbox ./src /sandbox/src
 ```
 
+By default, directory uploads extract the directory's contents into the
+destination. To keep the source directory name, use `--preserve-dir`:
+
+```bash
+openshell sandbox upload my-sandbox ./src /sandbox --preserve-dir
+# files land under /sandbox/src/
+```
+
 Push a single file:
 
 ```bash
@@ -46,7 +54,10 @@ openshell sandbox create --sync -- python main.py
 ```
 
 This collects tracked and untracked (non-ignored) files via
-`git ls-files` and streams them into `/sandbox` before the command runs.
+`git ls-files` and streams them into `/sandbox` before the command runs. The
+same git-aware filtering is used by `sandbox upload` unless you pass
+`--no-git-ignore`; `--preserve-dir` still wraps filtered directory uploads
+under the source directory name.
 
 ## Workflow: iterate on code in a sandbox
 

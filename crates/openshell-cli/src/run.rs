@@ -2404,6 +2404,7 @@ pub async fn sandbox_create(
                         &base_dir,
                         &files,
                         dest,
+                        None,
                         &effective_tls,
                     )
                     .await?;

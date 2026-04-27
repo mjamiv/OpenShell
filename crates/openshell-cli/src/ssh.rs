@@ -459,6 +459,7 @@ enum UploadSource {
     FileList {
         base_dir: PathBuf,
         files: Vec<String>,
+        tar_prefix: Option<std::ffi::OsString>,
     },
 }
 
@@ -526,17 +527,22 @@ async fn ssh_tar_upload(
                     ));
                 }
             }
-            UploadSource::FileList { base_dir, files } => {
+            UploadSource::FileList {
+                base_dir,
+                files,
+                tar_prefix,
+            } => {
                 for file in &files {
                     let full_path = base_dir.join(file);
+                    let tar_name = file_list_tar_name(file, tar_prefix.as_ref());
                     if full_path.is_file() {
                         archive
-                            .append_path_with_name(&full_path, file)
+                            .append_path_with_name(&full_path, &tar_name)
                             .into_diagnostic()
                             .wrap_err_with(|| format!("failed to add {file} to tar archive"))?;
                     } else if full_path.is_dir() {
                         archive
-                            .append_dir_all(file, &full_path)
+                            .append_dir_all(&tar_name, &full_path)
                             .into_diagnostic()
                             .wrap_err_with(|| {
                                 format!("failed to add directory {file} to tar archive")
@@ -590,6 +596,7 @@ pub async fn sandbox_sync_up_files(
     base_dir: &Path,
     files: &[String],
     dest: Option<&str>,
+    tar_prefix: Option<std::ffi::OsString>,
     tls: &TlsOptions,
 ) -> Result<()> {
     if files.is_empty() {
@@ -602,6 +609,7 @@ pub async fn sandbox_sync_up_files(
         UploadSource::FileList {
             base_dir: base_dir.to_path_buf(),
             files: files.to_vec(),
+            tar_prefix,
         },
         tls,
     )
@@ -697,6 +705,13 @@ fn directory_upload_prefix(local_path: &Path) -> std::ffi::OsString {
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| ".".into())
+}
+
+fn file_list_tar_name(file: &str, tar_prefix: Option<&std::ffi::OsString>) -> PathBuf {
+    match tar_prefix {
+        Some(prefix) if prefix != "." => Path::new(prefix).join(file),
+        _ => PathBuf::from(file),
+    }
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -1318,6 +1333,30 @@ mod tests {
         assert_eq!(
             directory_upload_prefix(Path::new("/")),
             std::ffi::OsString::from(".")
+        );
+    }
+
+    #[test]
+    fn file_list_tar_name_wraps_entries_under_prefix() {
+        let prefix = std::ffi::OsString::from("src");
+
+        assert_eq!(
+            file_list_tar_name("lib/main.rs", Some(&prefix)),
+            PathBuf::from("src/lib/main.rs")
+        );
+    }
+
+    #[test]
+    fn file_list_tar_name_keeps_entries_flat_for_dot_or_missing_prefix() {
+        let dot = std::ffi::OsString::from(".");
+
+        assert_eq!(
+            file_list_tar_name("lib/main.rs", Some(&dot)),
+            PathBuf::from("lib/main.rs")
+        );
+        assert_eq!(
+            file_list_tar_name("lib/main.rs", None),
+            PathBuf::from("lib/main.rs")
         );
     }
 
